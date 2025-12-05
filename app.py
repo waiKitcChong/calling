@@ -1,139 +1,184 @@
-import os
-import json
 from flask import Flask, request, jsonify
-import requests
-from dotenv import load_dotenv
-
-# Firebase admin
+from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, messaging
-
-# optional Agora token builder import (if available)
-try:
-    from agora_token_builder import RtcTokenBuilder, Role_Attendee
-    AGORA_TOKEN_BUILDER_AVAILABLE = True
-except Exception:
-    AGORA_TOKEN_BUILDER_AVAILABLE = False
-
-load_dotenv()
-
-SUPABASE_URL = os.environ.get('SUPABASE_URL')  # e.g. https://<project>.supabase.co/rest/v1
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
-FIREBASE_CRED_JSON = os.environ.get('FIREBASE_CRED_JSON')  # path to service account json file
-AGORA_APP_ID = os.environ.get('AGORA_APP_ID', '')
-AGORA_APP_CERTIFICATE = os.environ.get('AGORA_APP_CERTIFICATE', '')
-
-# Initialize Firebase admin
-if not firebase_admin._apps:
-    cred = credentials.Certificate(FIREBASE_CRED_JSON)
-    firebase_admin.initialize_app(cred)
+import os
+from supabase import create_client, Client
+from datetime import datetime
 
 app = Flask(__name__)
+CORS(app)
 
-def get_fcm_token_for_tourist(tourist_id):
-    """Query Supabase REST to retrieve fcm token for a given tourist_id."""
-    url = f"{SUPABASE_URL}/users_fcm_tokens?tourist_id=eq.{tourist_id}"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-    }
-    r = requests.get(url, headers=headers)
-    if r.status_code == 200:
-        data = r.json()
-        if len(data) > 0:
-            return data[0].get('fcm_token')
-    return None
+# 初始化 Firebase Admin SDK
+# 需要在环境变量中设置 FIREBASE_CREDENTIALS (JSON格式)
+firebase_creds = os.environ.get('FIREBASE_CREDENTIALS')
+if firebase_creds:
+    import json
+    cred_dict = json.loads(firebase_creds)
+    cred = credentials.Certificate(cred_dict)
+    firebase_admin.initialize_app(cred)
 
-@app.route('/send_call', methods=['POST'])
-def send_call():
-    payload = request.get_json()
-    caller_id = payload.get('caller_id')
-    caller_name = payload.get('caller_name')
-    callee_id = payload.get('callee_id')
-    channel_name = payload.get('channel_name')
-    call_type = payload.get('call_type', 'video')
+# 初始化 Supabase
+supabase_url = os.environ.get('SUPABASE_URL')
+supabase_key = os.environ.get('SUPABASE_KEY')
+supabase: Client = create_client(supabase_url, supabase_key)
 
-    token = get_fcm_token_for_tourist(callee_id)
-    if not token:
-        return jsonify({"error": "callee token not found"}), 404
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
 
-    data = {
-        "type": "incoming_call",
-        "caller_id": caller_id,
-        "caller_name": caller_name,
-        "channel_name": channel_name,
-        "call_type": call_type,
-    }
-
-    message = messaging.Message(
-        data=data,
-        token=token,
-        android=messaging.AndroidConfig(
-            priority='high',
-            notification=messaging.AndroidNotification(
-                sound='default',
-                click_action='FLUTTER_NOTIFICATION_CLICK'
-            )
-        ),
-        apns=messaging.APNSConfig(headers={'apns-priority': '10'})
-    )
-
-    resp = messaging.send(message)
-    return jsonify({"result": resp})
-
-@app.route('/call_response', methods=['POST'])
-def call_response():
-    payload = request.get_json()
-    from_id = payload.get('from_id')
-    to_id = payload.get('to_id')
-    channel_name = payload.get('channel_name')
-    response = payload.get('response')  # 'accepted' or 'rejected'
-
-    token = get_fcm_token_for_tourist(to_id)
-    if not token:
-        return jsonify({"error": "target token not found"}), 404
-
-    data = {
-        "type": "call_accepted" if response == 'accepted' else 'call_rejected',
-        "from_id": from_id,
-        "channel_name": channel_name,
-    }
-
-    message = messaging.Message(data=data, token=token)
-    resp = messaging.send(message)
-    return jsonify({"result": resp})
-
-@app.route('/generate_agora_token', methods=['POST'])
-def generate_agora_token():
-    """
-    Request JSON:
-    {
-      "channel_name": "private_TRS25001_TRS25002_...",
-      "uid": 0,
-      "expire_in_seconds": 3600
-    }
-    """
-    payload = request.get_json()
-    channel_name = payload.get('channel_name')
-    uid = int(payload.get('uid', 0))
-    expire_in_seconds = int(payload.get('expire_in_seconds', 3600))
-
-    if not AGORA_APP_ID:
-        return jsonify({"token": "", "warning": "AGORA_APP_ID not configured, returning empty token (test mode)"}), 200
-
-    if not AGORA_APP_CERTIFICATE or not AGORA_TOKEN_BUILDER_AVAILABLE:
-        # If builder not available, fallback to empty token for test purposes
-        return jsonify({"token": "", "warning": "Agora token builder not available or certificate missing. Install agora-access-token and set AGORA_APP_CERTIFICATE"}), 200
-
-    # Use Agora token builder to generate token
+@app.route('/api/call/initiate', methods=['POST'])
+def initiate_call():
+    """发起视频通话"""
     try:
-        from agora_token_builder import RtcTokenBuilder, Role_Attendee
-        current_ts = int(__import__('time').time())
-        privilege_expired_ts = current_ts + expire_in_seconds
-        token = RtcTokenBuilder.buildTokenWithUid(AGORA_APP_ID, AGORA_APP_CERTIFICATE, channel_name, uid, Role_Attendee, privilege_expired_ts)
-        return jsonify({"token": token}), 200
+        data = request.json
+        caller_id = data.get('caller_id')
+        caller_name = data.get('caller_name')
+        receiver_id = data.get('receiver_id')
+        call_type = data.get('call_type', 'video')  # video or audio
+        channel_id = data.get('channel_id')  # Agora 频道ID
+        
+        if not all([caller_id, caller_name, receiver_id, channel_id]):
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        # 从数据库获取接收者的 FCM token
+        response = supabase.table('users_fcm_tokens')\
+            .select('fcm_token')\
+            .eq('tourist_id', receiver_id)\
+            .order('updated_at', desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if not response.data:
+            return jsonify({"error": "Receiver FCM token not found"}), 404
+        
+        fcm_token = response.data[0]['fcm_token']
+        
+        # 构建 FCM 消息
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=f'{caller_name} 正在呼叫你',
+                body=f'{"视频" if call_type == "video" else "语音"}通话',
+            ),
+            data={
+                'type': 'incoming_call',
+                'call_type': call_type,
+                'caller_id': caller_id,
+                'caller_name': caller_name,
+                'channel_id': channel_id,
+                'timestamp': datetime.now().isoformat(),
+            },
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    channel_id='video_call_channel',
+                    priority='max',
+                    sound='default',
+                    visibility='public',
+                ),
+            ),
+            apns=messaging.APNSConfig(
+                headers={
+                    'apns-priority': '10',
+                },
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        alert=messaging.ApsAlert(
+                            title=f'{caller_name} 正在呼叫你',
+                            body=f'{"视频" if call_type == "video" else "语音"}通话',
+                        ),
+                        sound='default',
+                        badge=1,
+                        category='INCOMING_CALL',
+                    ),
+                ),
+            ),
+            token=fcm_token,
+        )
+        
+        # 发送推送通知
+        response = messaging.send(message)
+        
+        return jsonify({
+            "success": True,
+            "message_id": response,
+            "receiver_id": receiver_id,
+        }), 200
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/call/end', methods=['POST'])
+def end_call():
+    """结束通话通知"""
+    try:
+        data = request.json
+        caller_id = data.get('caller_id')
+        receiver_id = data.get('receiver_id')
+        channel_id = data.get('channel_id')
+        
+        # 获取接收者的 FCM token
+        response = supabase.table('users_fcm_tokens')\
+            .select('fcm_token')\
+            .eq('tourist_id', receiver_id)\
+            .order('updated_at', desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if response.data:
+            fcm_token = response.data[0]['fcm_token']
+            
+            message = messaging.Message(
+                data={
+                    'type': 'call_ended',
+                    'caller_id': caller_id,
+                    'channel_id': channel_id,
+                },
+                token=fcm_token,
+            )
+            
+            messaging.send(message)
+        
+        return jsonify({"success": True}), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/call/reject', methods=['POST'])
+def reject_call():
+    """拒接通话通知"""
+    try:
+        data = request.json
+        caller_id = data.get('caller_id')
+        receiver_id = data.get('receiver_id')
+        
+        # 通知发起者通话被拒绝
+        response = supabase.table('users_fcm_tokens')\
+            .select('fcm_token')\
+            .eq('tourist_id', caller_id)\
+            .order('updated_at', desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if response.data:
+            fcm_token = response.data[0]['fcm_token']
+            
+            message = messaging.Message(
+                data={
+                    'type': 'call_rejected',
+                    'receiver_id': receiver_id,
+                },
+                token=fcm_token,
+            )
+            
+            messaging.send(message)
+        
+        return jsonify({"success": True}), 200
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)

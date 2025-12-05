@@ -1,6 +1,6 @@
-flask
+Flask
+Flask-Cors
 firebase-admin
-requests
+supabase
 python-dotenv
-agora-access-token==3.3.0
-
+requests
