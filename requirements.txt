@@ -4,3 +4,4 @@ firebase-admin
 supabase
 python-dotenv
 requests
+gunicorn
