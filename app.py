@@ -3,182 +3,171 @@ from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, messaging
 import os
-from supabase import create_client, Client
-from datetime import datetime
+import json
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Enable CORS for Flutter
 
-# 初始化 Firebase Admin SDK
-# 需要在环境变量中设置 FIREBASE_CREDENTIALS (JSON格式)
-firebase_creds = os.environ.get('FIREBASE_CREDENTIALS')
-if firebase_creds:
-    import json
-    cred_dict = json.loads(firebase_creds)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
-
-# 初始化 Supabase
-supabase_url = os.environ.get('SUPABASE_URL')
-supabase_key = os.environ.get('SUPABASE_KEY')
-supabase: Client = create_client(supabase_url, supabase_key)
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
-
-@app.route('/api/call/initiate', methods=['POST'])
-def initiate_call():
-    """发起视频通话"""
+# Initialize Firebase Admin SDK
+def initialize_firebase():
     try:
-        data = request.json
-        caller_id = data.get('caller_id')
-        caller_name = data.get('caller_name')
-        receiver_id = data.get('receiver_id')
-        call_type = data.get('call_type', 'video')  # video or audio
-        channel_id = data.get('channel_id')  # Agora 频道ID
+        # Try to get service account from environment variable (for Render)
+        service_account_json = os.getenv('FIREBASE_SERVICE_ACCOUNT')
         
-        if not all([caller_id, caller_name, receiver_id, channel_id]):
-            return jsonify({"error": "Missing required fields"}), 400
+        if service_account_json:
+            # Parse JSON from environment variable
+            service_account_dict = json.loads(service_account_json)
+            cred = credentials.Certificate(service_account_dict)
+        else:
+            # Fallback to local file (for development)
+            cred = credentials.Certificate('service_account.json')
         
-        # 从数据库获取接收者的 FCM token
-        response = supabase.table('users_fcm_tokens')\
-            .select('fcm_token')\
-            .eq('tourist_id', receiver_id)\
-            .order('updated_at', desc=True)\
-            .limit(1)\
-            .execute()
+        firebase_admin.initialize_app(cred)
+        print('✅ Firebase Admin SDK initialized')
+    except Exception as e:
+        print(f'❌ Error initializing Firebase: {e}')
+
+initialize_firebase()
+
+@app.route('/')
+def home():
+    return jsonify({
+        'status': 'online',
+        'service': 'TripMate Video Call Notification Service',
+        'endpoints': {
+            '/send-call-notification': 'POST - Send video call notification',
+            '/health': 'GET - Health check'
+        }
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy'}), 200
+
+@app.route('/send-call-notification', methods=['POST', 'OPTIONS'])
+def send_call_notification():
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        data = request.get_json()
         
-        if not response.data:
-            return jsonify({"error": "Receiver FCM token not found"}), 404
+        # Validate required fields
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
         
-        fcm_token = response.data[0]['fcm_token']
+        fcm_token = data.get('token')
+        title = data.get('title', 'Incoming Video Call')
+        body = data.get('body', 'You have an incoming call')
+        notification_data = data.get('data', {})
         
-        # 构建 FCM 消息
+        if not fcm_token:
+            return jsonify({'error': 'FCM token is required'}), 400
+        
+        print(f'📞 Sending call notification to token: {fcm_token[:20]}...')
+        
+        # Create FCM message
         message = messaging.Message(
             notification=messaging.Notification(
-                title=f'{caller_name} 正在呼叫你',
-                body=f'{"视频" if call_type == "video" else "语音"}通话',
+                title=title,
+                body=body,
             ),
-            data={
-                'type': 'incoming_call',
-                'call_type': call_type,
-                'caller_id': caller_id,
-                'caller_name': caller_name,
-                'channel_id': channel_id,
-                'timestamp': datetime.now().isoformat(),
-            },
+            data=notification_data,
+            token=fcm_token,
             android=messaging.AndroidConfig(
                 priority='high',
                 notification=messaging.AndroidNotification(
-                    channel_id='video_call_channel',
-                    priority='max',
                     sound='default',
+                    channel_id='tripmate_calls',
+                    priority='max',
                     visibility='public',
-                ),
+                    default_sound=True,
+                    default_vibrate_timings=True,
+                )
             ),
             apns=messaging.APNSConfig(
-                headers={
-                    'apns-priority': '10',
-                },
                 payload=messaging.APNSPayload(
                     aps=messaging.Aps(
-                        alert=messaging.ApsAlert(
-                            title=f'{caller_name} 正在呼叫你',
-                            body=f'{"视频" if call_type == "video" else "语音"}通话',
-                        ),
                         sound='default',
                         badge=1,
-                        category='INCOMING_CALL',
-                    ),
-                ),
-            ),
-            token=fcm_token,
+                        content_available=True,
+                    )
+                )
+            )
         )
         
-        # 发送推送通知
+        # Send notification
         response = messaging.send(message)
         
+        print(f'✅ Notification sent successfully: {response}')
+        
         return jsonify({
-            "success": True,
-            "message_id": response,
-            "receiver_id": receiver_id,
+            'success': True,
+            'message_id': response
+        }), 200
+        
+    except messaging.UnregisteredError:
+        print('❌ Error: FCM token is invalid or unregistered')
+        return jsonify({
+            'error': 'Invalid or unregistered FCM token'
+        }), 400
+        
+    except Exception as e:
+        print(f'❌ Error sending notification: {str(e)}')
+        return jsonify({
+            'error': 'Failed to send notification',
+            'details': str(e)
+        }), 500
+
+@app.route('/send-batch-notifications', methods=['POST'])
+def send_batch_notifications():
+    """Send notifications to multiple tokens (for group calls)"""
+    try:
+        data = request.get_json()
+        tokens = data.get('tokens', [])
+        title = data.get('title', 'Incoming Video Call')
+        body = data.get('body', 'You have an incoming call')
+        notification_data = data.get('data', {})
+        
+        if not tokens:
+            return jsonify({'error': 'No tokens provided'}), 400
+        
+        # Create multicast message
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(
+                title=title,
+                body=body,
+            ),
+            data=notification_data,
+            tokens=tokens,
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    sound='default',
+                    channel_id='tripmate_calls',
+                )
+            ),
+        )
+        
+        # Send to multiple devices
+        response = messaging.send_multicast(message)
+        
+        print(f'✅ Batch notification sent: {response.success_count} successful, {response.failure_count} failed')
+        
+        return jsonify({
+            'success': True,
+            'success_count': response.success_count,
+            'failure_count': response.failure_count
         }), 200
         
     except Exception as e:
-        print(f"Error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/call/end', methods=['POST'])
-def end_call():
-    """结束通话通知"""
-    try:
-        data = request.json
-        caller_id = data.get('caller_id')
-        receiver_id = data.get('receiver_id')
-        channel_id = data.get('channel_id')
-        
-        # 获取接收者的 FCM token
-        response = supabase.table('users_fcm_tokens')\
-            .select('fcm_token')\
-            .eq('tourist_id', receiver_id)\
-            .order('updated_at', desc=True)\
-            .limit(1)\
-            .execute()
-        
-        if response.data:
-            fcm_token = response.data[0]['fcm_token']
-            
-            message = messaging.Message(
-                data={
-                    'type': 'call_ended',
-                    'caller_id': caller_id,
-                    'channel_id': channel_id,
-                },
-                token=fcm_token,
-            )
-            
-            messaging.send(message)
-        
-        return jsonify({"success": True}), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/call/reject', methods=['POST'])
-def reject_call():
-    """拒接通话通知"""
-    try:
-        data = request.json
-        caller_id = data.get('caller_id')
-        receiver_id = data.get('receiver_id')
-        
-        # 通知发起者通话被拒绝
-        response = supabase.table('users_fcm_tokens')\
-            .select('fcm_token')\
-            .eq('tourist_id', caller_id)\
-            .order('updated_at', desc=True)\
-            .limit(1)\
-            .execute()
-        
-        if response.data:
-            fcm_token = response.data[0]['fcm_token']
-            
-            message = messaging.Message(
-                data={
-                    'type': 'call_rejected',
-                    'receiver_id': receiver_id,
-                },
-                token=fcm_token,
-            )
-            
-            messaging.send(message)
-        
-        return jsonify({"success": True}), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f'❌ Error sending batch notification: {str(e)}')
+        return jsonify({
+            'error': 'Failed to send batch notification',
+            'details': str(e)
+        }), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
